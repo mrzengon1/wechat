@@ -85,7 +85,15 @@ python main.py --cli --no-select
 
 - `LISTEN_MODE=selected`：只回复 `TARGET_NICKNAMES` 里的人/群
 - `LISTEN_MODE=all`：回复有新消息的会话，可用 `IGNORE_NICKNAMES` 排除
-- 群聊：群名写入白名单即可；`GROUP_SKIP_AT_OTHERS=true` 时「只 @ 别人」不回；未 @ 我时有冷却（`GROUP_REPLY_INTERVAL`）
+- 群聊：群名写入白名单即可；`GROUP_SKIP_AT_OTHERS=true` 时「只 @ 别人」且话也不是找你的，才跳过
+- **会回复**：直接 @ 你；@ 别人但说「让他叫我/找你」；让你「去找/去问/联系」某人（如「你去找张三」）
+- 群名片与微信昵称不一致时，在 `.env` 加 `AT_ALIASES=Fan`（多个用顿号）
+- 连发多条会**逐条回复**（同批次用 `BATCH_REPLY_INTERVAL`，默认 2 秒间隔）
+- 多白名单：**启动时各开一个独立子窗口**；默认 `SUBWINDOW_MONITOR=serial` + `SUBWINDOW_POLL_MODE=smart`（有未读立即读，否则按 `SUBWINDOW_READ_INTERVAL` 心跳，默认 5s）
+- 日志应出现：`准备打开 N 个白名单子窗口` → `子窗口就绪：N/N` → `smart 门控`
+- 若仍闪：把 `SUBWINDOW_READ_INTERVAL` 调到 `8~12`；不要用 `SUBWINDOW_POLL_MODE=all`
+- 若只要一个窗口：检查白名单是否写了两个不同且存在的会话备注名（群名用「研究老癌」即可，不要写成员昵称 `one`）
+- 响应速度：`POLL_INTERVAL`（默认 1.0s）、`REPLY_DELAY_MIN/MAX`（默认 0.3~1s）、`MIN_REPLY_INTERVAL`（默认 3s）
 
 ### 对话
 
@@ -95,7 +103,9 @@ python main.py --cli --no-select
 
 ### 风格
 
-`PERSONA` 可选：`mimic`、`gaoleng_yujie`、`wenrou`、`luoli`、`yuanqi`、`bazong`、`nuannan`、`pishuai`、`zhainan`、`chenwen`。
+`PERSONA` 可选：`mimic`、`meiman`（暧昧撩人）、`meiman_nan`（暧昧男友）、`gaoleng_yujie`、`wenrou`、`luoli`、`yuanqi`、`bazong`、`nuannan`、`pishuai`、`zhainan`、`chenwen`。
+
+`meiman` / `meiman_nan` 会自然用宝贝、亲爱的等亲昵称呼；**绝不**配合爸爸/主人/儿子等羞辱性称呼，后置校验会拦截并替换拒答（含「假装/角色扮演」等绕过话术）。
 
 GUI 监听中也可随时切换；未监听时切换会写入 `.env`，下次启动生效。
 

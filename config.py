@@ -81,7 +81,10 @@ def update_env_vars(updates: Dict[str, str]) -> None:
 def reload_listen_config() -> None:
     """从 .env 重新加载监听相关配置到模块变量。"""
     global LISTEN_MODE, TARGET_NICKNAMES, REPLY_GROUP_CHATS
-    global GROUP_REPLY_INTERVAL, GROUP_SKIP_AT_OTHERS
+    global GROUP_REPLY_INTERVAL, GROUP_SKIP_AT_OTHERS, AT_ALIASES
+    global MIN_REPLY_INTERVAL, BATCH_REPLY_INTERVAL, POLL_INTERVAL, REPLY_DELAY_RANGE
+    global SUBWINDOW_IDLE_ROTATE, SUBWINDOW_MONITOR, SUBWINDOW_POLL_MODE, SUBWINDOW_STAGGER
+    global SUBWINDOW_READ_INTERVAL
     global USE_CHAT_HISTORY, HISTORY_TURNS, WECHAT_CONTEXT_LIMIT, WECHAT_CONTEXT_LIMIT_TECHNICAL
     global LEARN_MY_TONE, TONE_SAMPLE_LIMIT, TONE_MIN_SELF
 
@@ -94,12 +97,28 @@ def reload_listen_config() -> None:
         "true",
         "yes",
     )
-    GROUP_REPLY_INTERVAL = int(os.getenv("GROUP_REPLY_INTERVAL", "45"))
+    GROUP_REPLY_INTERVAL = int(os.getenv("GROUP_REPLY_INTERVAL", "12"))
     GROUP_SKIP_AT_OTHERS = os.getenv("GROUP_SKIP_AT_OTHERS", "true").lower() in (
         "1",
         "true",
         "yes",
     )
+    AT_ALIASES = _split_names(os.getenv("AT_ALIASES", ""))
+    MIN_REPLY_INTERVAL = int(os.getenv("MIN_REPLY_INTERVAL", "3"))
+    BATCH_REPLY_INTERVAL = int(os.getenv("BATCH_REPLY_INTERVAL", "2"))
+    POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "1.0"))
+    _delay_min = float(os.getenv("REPLY_DELAY_MIN", "0.3"))
+    _delay_max = float(os.getenv("REPLY_DELAY_MAX", "1.0"))
+    REPLY_DELAY_RANGE = (min(_delay_min, _delay_max), max(_delay_min, _delay_max))
+    SUBWINDOW_IDLE_ROTATE = float(os.getenv("SUBWINDOW_IDLE_ROTATE", "8.0"))
+    SUBWINDOW_MONITOR = os.getenv("SUBWINDOW_MONITOR", "serial").strip().lower()
+    SUBWINDOW_POLL_MODE = os.getenv("SUBWINDOW_POLL_MODE", "smart").strip().lower()
+    SUBWINDOW_STAGGER = float(os.getenv("SUBWINDOW_STAGGER", "0.25"))
+    SUBWINDOW_READ_INTERVAL = float(os.getenv("SUBWINDOW_READ_INTERVAL", "5.0"))
+    if SUBWINDOW_MONITOR not in ("threads", "serial"):
+        SUBWINDOW_MONITOR = "serial"
+    if SUBWINDOW_POLL_MODE not in ("smart", "all", "lite"):
+        SUBWINDOW_POLL_MODE = "smart"
     USE_CHAT_HISTORY = os.getenv("USE_CHAT_HISTORY", "true").lower() in (
         "1",
         "true",
@@ -145,22 +164,41 @@ REPLY_GROUP_CHATS = os.getenv("REPLY_GROUP_CHATS", "true").lower() in (
     "yes",
 )
 # 群聊：未 @ 我时的回复冷却（秒），@ 我仍用 MIN_REPLY_INTERVAL
-GROUP_REPLY_INTERVAL = int(os.getenv("GROUP_REPLY_INTERVAL", "45"))
+GROUP_REPLY_INTERVAL = int(os.getenv("GROUP_REPLY_INTERVAL", "12"))
 # 群聊：消息仅 @ 别人（不含我）时不回复
 GROUP_SKIP_AT_OTHERS = os.getenv("GROUP_SKIP_AT_OTHERS", "true").lower() in (
     "1",
     "true",
     "yes",
 )
+# 群聊 @ 识别：除微信昵称外，额外把哪些名字当作 @ 我（如群名片 Fan）
+AT_ALIASES: List[str] = _split_names(os.getenv("AT_ALIASES", ""))
 
 TEXT_ONLY = True
 
 # 语音消息：调用 PC 微信「语音转文字」后按文字回复
 ENABLE_VOICE = os.getenv("ENABLE_VOICE", "true").lower() in ("1", "true", "yes")
-MIN_REPLY_INTERVAL = int(os.getenv("MIN_REPLY_INTERVAL", "5"))
+MIN_REPLY_INTERVAL = int(os.getenv("MIN_REPLY_INTERVAL", "3"))
+# 同批次连发多条时的最短回复间隔（秒）
+BATCH_REPLY_INTERVAL = int(os.getenv("BATCH_REPLY_INTERVAL", "2"))
 # 全量轮询间隔（秒）
-POLL_INTERVAL = 1.0
-REPLY_DELAY_RANGE = (1.0, 3.0)
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "1.0"))
+_delay_min = float(os.getenv("REPLY_DELAY_MIN", "0.3"))
+_delay_max = float(os.getenv("REPLY_DELAY_MAX", "1.0"))
+REPLY_DELAY_RANGE = (min(_delay_min, _delay_max), max(_delay_min, _delay_max))
+# 多子窗口监控方式（闪窗时务必用 serial + smart）
+# serial = 单线程（默认，更稳）；threads = 每窗口一线程（更勤，易闪）
+SUBWINDOW_MONITOR = os.getenv("SUBWINDOW_MONITOR", "serial").strip().lower()
+# smart=有未读或心跳到期才读（默认）；all=每轮全读；lite=仅未读/轮流空闲探测
+SUBWINDOW_POLL_MODE = os.getenv("SUBWINDOW_POLL_MODE", "smart").strip().lower()
+SUBWINDOW_STAGGER = float(os.getenv("SUBWINDOW_STAGGER", "0.25"))
+# 无未读时，每个子窗口最少隔多久再读一次消息（秒）；越大越不闪
+SUBWINDOW_READ_INTERVAL = float(os.getenv("SUBWINDOW_READ_INTERVAL", "5.0"))
+SUBWINDOW_IDLE_ROTATE = float(os.getenv("SUBWINDOW_IDLE_ROTATE", "8.0"))
+if SUBWINDOW_MONITOR not in ("threads", "serial"):
+    SUBWINDOW_MONITOR = "serial"
+if SUBWINDOW_POLL_MODE not in ("smart", "all", "lite"):
+    SUBWINDOW_POLL_MODE = "smart"
 
 # —— 大模型（OpenAI 兼容 Chat Completions）——
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")

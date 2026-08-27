@@ -339,17 +339,22 @@ def _should_reply_to_msg(
     chat: Any,
     who: str = "",
     wx: Any = None,
+    allow_not_latest: bool = False,
 ) -> bool:
     """仅当最新一条有效消息是对方发的时才回复；自己发的 / 纯确认语跳过。"""
     if not _is_from_friend(msg):
         log(f"  跳过：自己/系统消息 attr={_msg_attr(msg)}")
         return False
 
+    if _is_ack_message(msg, who, chat, wx):
+        log("  跳过：确认语（收到/好的/ok 等），无需回复")
+        return False
+
+    if allow_not_latest:
+        return True
+
     msgs = _get_chat_msgs(chat)
     if not msgs:
-        if _is_ack_message(msg, who, chat, wx):
-            log("  跳过：确认语，无需回复")
-            return False
         return True
 
     latest = _latest_human_msg(msgs)
@@ -362,10 +367,6 @@ def _should_reply_to_msg(
 
     if not _same_msg(msg, latest):
         log("  跳过：不是会话最新一条，继续监听")
-        return False
-
-    if _is_ack_message(msg, who, chat, wx):
-        log("  跳过：确认语（收到/好的/ok 等），无需回复")
         return False
 
     return True
@@ -391,7 +392,7 @@ def _should_handle_msg(
     if mtype == "voice" and config.ENABLE_VOICE:
         return True
 
-    if wx is not None and _is_at_me(msg, wx, chat, who, aliases):
+    if wx is not None and _is_directed_at_me(msg, wx, chat, who, aliases):
         return True
 
     if config.TEXT_ONLY:
@@ -448,8 +449,9 @@ def _msg_sender(msg: Any) -> str:
 
 
 _EMAIL_AT_PATTERN = re.compile(r"[\w.+-]+@[\w.-]+\.\w+")
+# 微信 @ 后常有 \u2005 薄空格；也可能紧挨中文如 鹏@Fan
 _AT_NAME_PATTERN = re.compile(
-    r"\{@([^}]+)\}|@([^\s\u2005\u2006\u2009@，,。！？!?：:;；]+)"
+    r"\{@([^}]+)\}|@(?:[\u2005\u2006\u2009\s]*)([^\s@，,。！？!?：:;；\r\n]+)"
 )
 
 
@@ -459,8 +461,11 @@ def _name_matches_alias(name: str, aliases: Set[str]) -> bool:
         return False
     if n in aliases:
         return True
+    n_low = n.lower()
     for alias in aliases:
         if alias in n or n in alias:
+            return True
+        if n_low == alias.lower():
             return True
     return False
 
@@ -511,11 +516,88 @@ def _is_at_others_not_me(msg: Any, aliases: Optional[Set[str]]) -> bool:
     return True
 
 
+_ASK_CONTACT_ME_RES = (
+    re.compile(r"让.{0,18}(叫|联系|找|喊|@).{0,12}(我|咱|俺|你)"),
+    re.compile(r"(叫|联系|找|喊).{0,6}(我|咱|俺|你)(?:吧|啊|呢|哈|嘛|呗|[，,。！？]|$)"),
+    re.compile(r"(联系我|找我|叫我|喊我|联系你|找你|叫你|喊你)"),
+    re.compile(r"让.{0,24}教.{0,4}你"),
+    re.compile(r"教.{0,4}你(?:玩|一下|呗|吗)?"),
+    re.compile(r"带你(?:玩|一起)"),
+)
+_BOT_ACTION_RES = (
+    re.compile(r"^(你|您)(去|帮|让|问|找|联系|叫|喊)"),
+    re.compile(r"[，,。！？\n](你|您)(去|帮|让|问|找|联系|叫|喊)"),
+)
+# @ 别人后紧跟「你+动作」通常是在跟被 @ 的人说，不是找 bot
+_AT_THEN_YOU_ACTION = re.compile(
+    r"@[^\s\u2005\u2006\u2009@，,。！？!?：:;；{}\[\]]+\s*你(去|帮|让|问|找|联系|叫|喊)"
+)
+
+
+def _strip_at_tokens(text: str) -> str:
+    scrubbed = _EMAIL_AT_PATTERN.sub(" ", text or "")
+    scrubbed = re.sub(r"\{@([^}]+)\}", " ", scrubbed)
+    scrubbed = re.sub(
+        r"@[^\s\u2005\u2006\u2009@，,。！？!?：:;；{}\[\]\r\n]+",
+        " ",
+        scrubbed,
+    )
+    return re.sub(r"\s+", " ", scrubbed).strip()
+
+
+def _asks_others_contact_me(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    return any(p.search(t) for p in _ASK_CONTACT_ME_RES)
+
+
+def _addresses_bot_to_act(text: str, *, at_others_not_me: bool) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    if at_others_not_me and _AT_THEN_YOU_ACTION.search(t):
+        return False
+    stripped = _strip_at_tokens(t)
+    return any(p.search(stripped) for p in _BOT_ACTION_RES)
+
+
+def _is_indirect_address_to_me(
+    msg: Any, aliases: Optional[Set[str]] = None
+) -> bool:
+    """@ 了别人但实际在找 bot：让别人联系 bot / 让 bot 去找别人等。"""
+    text = _msg_text_blob(msg).strip()
+    if not text:
+        return False
+    at_others = _is_at_others_not_me(msg, aliases)
+    if _asks_others_contact_me(text):
+        return True
+    return _addresses_bot_to_act(text, at_others_not_me=at_others)
+
+
+def _is_directed_at_me(
+    msg: Any,
+    wx: Any,
+    chat: Any,
+    who: str,
+    aliases: Optional[Set[str]] = None,
+) -> bool:
+    """@ 我，或语义上在找 bot（含间接）。"""
+    if _is_at_me(msg, wx, chat, who, aliases):
+        return True
+    return _is_indirect_address_to_me(msg, aliases)
+
+
 def _collect_self_aliases(wx: Any) -> Set[str]:
     """收集可用于识别 @ 我的昵称/备注。"""
     aliases: Set[str] = set()
     if config.BOT_REAL_NAME:
         aliases.add(config.BOT_REAL_NAME.strip())
+
+    for name in config.AT_ALIASES:
+        n = (name or "").strip()
+        if n:
+            aliases.add(n)
 
     for source in (
         getattr(wx, "nickname", None),
@@ -566,13 +648,15 @@ def _text_mentions_alias(text: str, alias: str) -> bool:
     if not text or not alias:
         return False
     escaped = re.escape(alias)
+    flags = re.IGNORECASE if alias.isascii() else 0
     patterns = (
-        rf"@\s*{escaped}(?:[\u2005\u2006\u2009\s，,。！？!?：:;；]|$)",
+        rf"@(?:[\u2005\u2006\u2009\s]*){escaped}(?:[\u2005\u2006\u2009\s，,。！？!?：:;；]|\r|\n|$)",
         rf"\{{@\s*{escaped}\s*}}",
+        rf"[\u4e00-\u9fff]{escaped}(?:[\u2005\u2006\u2009\s，,。！？!?：:;；]|\r|\n|$)",
     )
     scrubbed = _EMAIL_AT_PATTERN.sub(" ", text)
     for pat in patterns:
-        if re.search(pat, scrubbed):
+        if re.search(pat, scrubbed, flags):
             return True
     return False
 
@@ -587,11 +671,9 @@ def _is_at_me(
     """判断群消息是否 @ 了我（排除邮箱里的 @）。"""
     if aliases is None:
         aliases = _collect_self_aliases(wx)
-    if not aliases:
-        return False
 
     blob = _msg_text_blob(msg)
-    if blob:
+    if blob and aliases:
         scrubbed = _EMAIL_AT_PATTERN.sub(" ", blob)
         for alias in sorted(aliases, key=len, reverse=True):
             if _text_mentions_alias(scrubbed, alias):
@@ -608,11 +690,8 @@ def _is_at_me(
             name = str(item).strip()
             if not name:
                 continue
-            if name in aliases:
+            if aliases and _name_matches_alias(name, aliases):
                 return True
-            for alias in aliases:
-                if alias in name or name in alias:
-                    return True
     return False
 
 
@@ -630,7 +709,9 @@ def _group_reply_skip_reason(
     if config.TARGET_NICKNAMES and not _allowed_who(who, allowed_names):
         return "群不在白名单"
     if config.GROUP_SKIP_AT_OTHERS and _is_at_others_not_me(msg, aliases):
-        return "消息 @ 了别人"
+        if not _is_indirect_address_to_me(msg, aliases):
+            at_names = _collect_at_names(msg, aliases)
+            return f"消息 @ 了别人（{','.join(at_names[:3])}）"
     return None
 
 
@@ -757,12 +838,23 @@ class Monitor:
             system_prompt=prompt,
             persona_name=display,
             gender_key=gender_key,
+            persona_key=persona_key,
         )
         self._last_reply_at: Dict[str, float] = {}
         self._allowed_names: set = set()
         self._seen_keys: Dict[str, Set[str]] = {}
         self._primed_chats: Set[str] = set()
         self._sub_chats: Dict[str, Any] = {}
+        self._free_subwindow_mode = False
+        self._subwindow_fail_count: Dict[str, int] = {}
+        self._subwindow_reopen_at: Dict[str, float] = {}
+        self._sub_poll_cursor = 0
+        self._sub_last_idle_poll = 0.0
+        self._sub_last_read_at: Dict[str, float] = {}
+        self._wl_sessions: List[Tuple[str, str, Any]] = []
+        self._wl_sessions_at = 0.0
+        self._wl_sessions_lock = threading.Lock()
+        self._sub_monitor_threads: List[threading.Thread] = []
         self._self_aliases: Set[str] = _collect_self_aliases(self.wx)
         self._stop = False
         self._style_lock = threading.Lock()
@@ -779,12 +871,19 @@ class Monitor:
                 )
                 if self._self_aliases:
                     log(f"@ 识别别名：{sorted(self._self_aliases)}")
+                elif any(_looks_like_group(n) for n in config.TARGET_NICKNAMES):
+                    log(
+                        "提示：群聊 @ 英文名/群名片请在 .env 设置 AT_ALIASES=Fan"
+                        "（多个用顿号），否则 @Fan 可能识别不到"
+                    )
             else:
                 log("支持私聊与群聊（群名写入白名单即可）")
         else:
             log(f"全量监听 | 忽略：{config.IGNORE_NICKNAMES}")
             log(f"回复群聊：{config.REPLY_GROUP_CHATS}")
-        log(f"仅按最新消息回复（历史={'开' if config.USE_CHAT_HISTORY else '关'}）")
+        log(
+            f"连发多条逐条回复；单条仍等最新（历史={'开' if config.USE_CHAT_HISTORY else '关'}）"
+        )
         if self.persona_key == "mimic":
             log("风格「模仿正常」：根据当前会话历史模仿你的语气")
         log(f"模型：{config.LLM_MODEL} @ {config.LLM_BASE_URL}")
@@ -814,7 +913,7 @@ class Monitor:
         prompt = build_system_prompt(gender_key, persona_key)
         self.gender_key = gender_key
         self.persona_key = persona_key
-        self.llm.apply_style(prompt, display, gender_key)
+        self.llm.apply_style(prompt, display, gender_key, persona_key)
         log(f"风格已切换 → {display}")
         return display
 
@@ -829,13 +928,20 @@ class Monitor:
         with self._style_lock:
             self.llm.apply_history_setting()
 
+        self._self_aliases = _collect_self_aliases(self.wx)
+        if self._self_aliases:
+            log(f"@ 识别别名：{sorted(self._self_aliases)}")
+
         if config.LISTEN_MODE == "selected" and self._listen_mode == "selected":
             self._allowed_names = set(config.TARGET_NICKNAMES)
             if HAS_LISTEN:
                 self._setup_selected_listeners()
             else:
-                self._setup_free_subwindows()
-            notes.append(f"白名单已更新：{sorted(self._allowed_names)}")
+                # 运行中改白名单需重启监听，避免反复 open/搜索导致子窗口来回切
+                notes.append(
+                    "白名单已保存；请停止后重新「开始监听」以打开新子窗口"
+                )
+            notes.append(f"白名单：{sorted(self._allowed_names)}")
         elif config.LISTEN_MODE == "all" and self._listen_mode == "all":
             notes.append(
                 f"群聊回复：{'开' if config.REPLY_GROUP_CHATS else '关'}"
@@ -893,6 +999,9 @@ class Monitor:
 
     def _setup_free_subwindows(self) -> None:
         """免费版：为白名单打开独立聊天子窗口。"""
+        self._free_subwindow_mode = True
+        self._subwindow_fail_count.clear()
+        self._subwindow_reopen_at.clear()
         self._allowed_names = set(config.TARGET_NICKNAMES)
         self._sub_chats = open_whitelist_subchats(
             self.wx, list(config.TARGET_NICKNAMES)
@@ -902,15 +1011,41 @@ class Monitor:
                 "未能打开任何白名单子窗口，请检查 TARGET_NICKNAMES 是否与会话名一致，"
                 "并保持微信主窗口可见"
             )
-        for who, chat in list(self._sub_chats.items()):
-            self._allowed_names.add(who)
-            # 首次同步历史，避免把旧消息当新消息回复
+        for name in config.TARGET_NICKNAMES:
+            chat = self._resolve_sub_chat(name)
+            if chat is None:
+                continue
+            self._allowed_names.add(chat.who)
             try:
-                self._poll_one_chat(who, chat=chat)
+                self._poll_one_chat(name, chat=chat)
+                now = time.time()
+                self._sub_last_read_at[name] = now
+                self._sub_last_read_at[getattr(chat, "who", name) or name] = now
             except Exception:
-                log(f"[{who}] 子窗口首次同步异常：\n{traceback.format_exc()}")
-        uniq = {id(c): c.who for c in self._sub_chats.values()}
-        log(f"已打开 {len(uniq)} 个独立子窗口，请保持子窗口不要关掉")
+                log(f"[{name}] 子窗口首次同步异常：\n{traceback.format_exc()}")
+        uniq = {id(c): c.who for c in self._unique_sub_chats()}
+        n = len(uniq)
+        names = ", ".join(sorted({c.who for c in self._unique_sub_chats()}))
+        want = len(config.TARGET_NICKNAMES)
+        if n < want:
+            log(
+                f"警告：只打开了 {n}/{want} 个子窗口（{names}）；"
+                "请确认白名单每项都是会话列表里的完整备注名，且互不重复"
+            )
+        mode = config.SUBWINDOW_MONITOR
+        poll = config.SUBWINDOW_POLL_MODE
+        if mode == "threads":
+            log(
+                f"已打开 {n} 个子窗口：{names}；threads 监控"
+                f"（心跳 {config.SUBWINDOW_READ_INTERVAL}s）"
+            )
+        elif poll == "all":
+            log(f"已打开 {n} 个子窗口：{names}；all 模式每 {config.POLL_INTERVAL}s 全读")
+        else:
+            log(
+                f"已打开 {n} 个子窗口：{names}；{poll} 门控"
+                f"（未读立即读 / 心跳 {config.SUBWINDOW_READ_INTERVAL}s）"
+            )
 
     def _teardown_listeners(self) -> None:
         try:
@@ -928,15 +1063,35 @@ class Monitor:
     def _allowed(self, who: str) -> bool:
         return _allowed_who(who, self._allowed_names)
 
-    def _in_cooldown(self, who: str, chat: Any = None, at_me: bool = False) -> bool:
+    def _in_cooldown(
+        self,
+        who: str,
+        chat: Any = None,
+        at_me: bool = False,
+        batch_mode: bool = False,
+    ) -> bool:
         last = self._last_reply_at.get(who, 0.0)
-        interval = config.MIN_REPLY_INTERVAL
-        if (
-            not at_me
-            and _is_group_chat(who, chat, self.wx)
-        ):
+        if batch_mode:
+            interval = config.BATCH_REPLY_INTERVAL
+        elif not at_me and _is_group_chat(who, chat, self.wx):
             interval = config.GROUP_REPLY_INTERVAL
+        else:
+            interval = config.MIN_REPLY_INTERVAL
         return time.time() - last < interval
+
+    def _unique_sub_chats(self) -> List[Any]:
+        seen: Set[int] = set()
+        out: List[Any] = []
+        for name in config.TARGET_NICKNAMES:
+            chat = self._resolve_sub_chat(name)
+            if chat is None:
+                continue
+            cid = id(chat)
+            if cid in seen:
+                continue
+            seen.add(cid)
+            out.append(chat)
+        return out
 
     def _resolve_sub_chat(self, who: str) -> Any | None:
         if who in self._sub_chats:
@@ -949,7 +1104,13 @@ class Monitor:
     def _poll_one_chat(self, who: str, chat: Any = None) -> None:
         """同步或处理新增消息；优先使用已打开的子窗口，避免切主窗口。"""
         if chat is None:
-            chat = self._resolve_sub_chat(who) or self._prepare_chat(who)
+            chat = self._resolve_sub_chat(who)
+            if chat is None and self._free_subwindow_mode:
+                return
+            if chat is None:
+                chat = self._prepare_chat(who)
+        if self._free_subwindow_mode and chat is self.wx:
+            return
         msgs = _get_chat_msgs(chat)
         keys = [_msg_key(m) for m in msgs]
 
@@ -979,10 +1140,29 @@ class Monitor:
         new_msgs = [m for m, k in zip(msgs, keys) if k not in seen]
         seen.update(keys)
 
+        friend_new = [
+            m
+            for m in new_msgs
+            if _is_from_friend(m)
+            and _should_handle_msg(m, self.wx, who, chat, self._self_aliases)
+            and not _group_reply_skip_reason(
+                m, who, chat, self.wx, self._self_aliases, self._allowed_names
+            )
+        ]
+        batch_mode = len(friend_new) > 1
+        friend_new_set = set(id(m) for m in friend_new)
+
         for msg in new_msgs:
             if self._stop:
                 break
-            self.handle_one(msg, who, chat=chat)
+            in_batch = batch_mode and id(msg) in friend_new_set
+            self.handle_one(
+                msg,
+                who,
+                chat=chat,
+                allow_not_latest=in_batch,
+                batch_mode=in_batch,
+            )
 
     def _session_name(self, session: Any) -> str:
         for attr in ("name", "nickname", "who"):
@@ -997,7 +1177,15 @@ class Monitor:
                     return val.strip()
         return str(session).strip()
 
-    def handle_one(self, msg: Any, who: str, chat: Any = None) -> None:
+    def handle_one(
+        self,
+        msg: Any,
+        who: str,
+        chat: Any = None,
+        *,
+        allow_not_latest: bool = False,
+        batch_mode: bool = False,
+    ) -> None:
         if not self._allowed(who):
             log(f"[{who}] 不在白名单，跳过")
             return
@@ -1009,25 +1197,34 @@ class Monitor:
             msg, who, chat, self.wx, self._self_aliases, self._allowed_names
         )
         if skip_reason:
-            log(f"[{who}] 跳过：{skip_reason}")
+            at_hint = _collect_at_names(msg, self._self_aliases)
+            if at_hint and "别人" in skip_reason:
+                log(
+                    f"[{who}] 跳过：{skip_reason}；"
+                    f"若 @ 的是你，请在 .env 加 AT_ALIASES={at_hint[0]}"
+                )
+            else:
+                log(f"[{who}] 跳过：{skip_reason}")
             return
-        if not _should_reply_to_msg(msg, chat, who, self.wx):
+        if not _should_reply_to_msg(
+            msg, chat, who, self.wx, allow_not_latest=allow_not_latest
+        ):
             return
 
         is_group = _is_group_chat(who, chat, self.wx)
         at_me = (
-            _is_at_me(msg, self.wx, chat, who, self._self_aliases)
+            _is_directed_at_me(msg, self.wx, chat, who, self._self_aliases)
             if is_group
             else False
         )
-        if self._in_cooldown(who, chat, at_me=at_me):
-            kind = "@我" if at_me else ("群聊" if is_group else "私聊")
+        if self._in_cooldown(who, chat, at_me=at_me, batch_mode=batch_mode):
+            kind = "@我/找我说" if at_me else ("群聊" if is_group else "私聊")
             log(f"[{who}] {kind}冷却中，跳过")
             return
 
         user_text = _resolve_user_text(msg, who, chat, self.wx)
         if not user_text:
-            if _is_at_me(msg, self.wx, chat, who, self._self_aliases):
+            if _is_directed_at_me(msg, self.wx, chat, who, self._self_aliases):
                 user_text = "[@我]"
             else:
                 return
@@ -1173,6 +1370,9 @@ class Monitor:
         sub = self._resolve_sub_chat(who)
         if sub is not None:
             return sub
+        if self._free_subwindow_mode:
+            log(f"[{who}] 无可用子窗口，跳过（不切主窗口）")
+            return self.wx
         try:
             if hasattr(self.wx, "GetSubWindow"):
                 got = self.wx.GetSubWindow(who)
@@ -1193,32 +1393,167 @@ class Monitor:
             log(f"[{who}] 切换会话失败：{e}")
         return self.wx
 
+    def _chat_matches_name(self, chat_who: str, name: str) -> bool:
+        if not chat_who or not name:
+            return False
+        if chat_who == name:
+            return True
+        return name in chat_who or chat_who in name
+
+    def _chat_has_unread(self, chat: Any) -> bool:
+        who = getattr(chat, "who", "") or ""
+        if who and who not in self._primed_chats:
+            return True
+        for _target, session_who, sess in self._find_whitelist_sessions():
+            if self._chat_matches_name(who, session_who) or self._chat_matches_name(
+                who, _target
+            ):
+                if self._session_unread(sess):
+                    return True
+        for name in config.TARGET_NICKNAMES:
+            if self._chat_matches_name(who, name) and name not in self._primed_chats:
+                return True
+        return False
+
+    def _chat_needs_read(self, chat: Any) -> bool:
+        """未读、未 priming、或心跳到期时才真正读子窗口消息。"""
+        who = getattr(chat, "who", "") or ""
+        if who and who not in self._primed_chats:
+            return True
+        if self._chat_has_unread(chat):
+            return True
+        last = self._sub_last_read_at.get(who, 0.0)
+        interval = max(1.0, float(config.SUBWINDOW_READ_INTERVAL))
+        return (time.time() - last) >= interval
+
+    def _chats_to_poll_this_cycle(self) -> List[Any]:
+        """serial：smart/lite=未读+心跳；all=每轮全读。"""
+        chats = self._unique_sub_chats()
+        if not chats:
+            return []
+        if config.SUBWINDOW_POLL_MODE == "all":
+            return chats
+
+        # smart：本轮读所有「需要读」的窗口（未读优先，心跳到期也读）
+        if config.SUBWINDOW_POLL_MODE == "smart":
+            due = [c for c in chats if self._chat_needs_read(c)]
+            return due
+
+        # lite：有未读就读热窗口；否则按 IDLE_ROTATE 轮流探一个
+        hot = [c for c in chats if self._chat_has_unread(c)]
+        if hot:
+            return hot
+
+        now = time.time()
+        if now - self._sub_last_idle_poll < config.SUBWINDOW_IDLE_ROTATE:
+            return []
+
+        idx = self._sub_poll_cursor % len(chats)
+        self._sub_poll_cursor += 1
+        self._sub_last_idle_poll = now
+        return [chats[idx]]
+
+    def _poll_one_subwindow(self, chat: Any) -> None:
+        from subwindows import rebind_sub_chat
+
+        who = getattr(chat, "who", "") or ""
+        alive = True
+        if hasattr(chat, "exists"):
+            alive = chat.exists()
+        if not alive:
+            fails = self._subwindow_fail_count.get(who, 0) + 1
+            self._subwindow_fail_count[who] = fails
+            if fails < 3:
+                return
+            now = time.time()
+            last_try = self._subwindow_reopen_at.get(who, 0.0)
+            if now - last_try < 60:
+                return
+            self._subwindow_reopen_at[who] = now
+            log(f"[{who}] 子窗口不可用，尝试重新绑定…")
+            rebuilt = rebind_sub_chat(self.wx, who)
+            if rebuilt is None:
+                from subwindows import open_sub_chat
+
+                rebuilt = open_sub_chat(self.wx, who)
+            if rebuilt is None:
+                return
+            with self._style_lock:
+                for key in list(self._sub_chats.keys()):
+                    if self._sub_chats.get(key) is chat:
+                        self._sub_chats[key] = rebuilt
+                self._sub_chats[who] = rebuilt
+                self._sub_chats[rebuilt.who] = rebuilt
+            chat = rebuilt
+            self._subwindow_fail_count[who] = 0
+        else:
+            self._subwindow_fail_count[who] = 0
+        self._poll_one_chat(chat.who, chat=chat)
+        self._sub_last_read_at[chat.who] = time.time()
+        if who and who != chat.who:
+            self._sub_last_read_at[who] = time.time()
+
     def _poll_subwindows(self) -> None:
-        """轮询已打开的独立子窗口，不切换主界面。"""
-        # 去重：同一 SubChat 只扫一次
-        seen_ids: Set[int] = set()
-        for who, chat in list(self._sub_chats.items()):
+        """serial 模式：单线程轮询子窗口。"""
+        chats = self._chats_to_poll_this_cycle()
+        for i, chat in enumerate(chats):
             if self._stop:
                 break
-            cid = id(chat)
-            if cid in seen_ids:
-                continue
-            seen_ids.add(cid)
+            who = getattr(chat, "who", "") or ""
             try:
-                if hasattr(chat, "exists") and not chat.exists():
-                    log(f"[{who}] 子窗口已关闭，尝试重新打开…")
-                    from subwindows import open_sub_chat
-
-                    rebuilt = open_sub_chat(self.wx, who)
-                    if rebuilt is None:
-                        continue
-                    self._sub_chats[who] = rebuilt
-                    self._sub_chats[rebuilt.who] = rebuilt
-                    chat = rebuilt
-                    self._primed_chats.discard(who)
-                self._poll_one_chat(chat.who, chat=chat)
+                self._poll_one_subwindow(chat)
             except Exception:
                 log(f"[{who}] 子窗口轮询异常：\n{traceback.format_exc()}")
+            if i + 1 < len(chats) and config.SUBWINDOW_STAGGER > 0:
+                time.sleep(config.SUBWINDOW_STAGGER)
+
+    def _subwindow_monitor_loop(
+        self, whitelist_name: str, phase_offset: float = 0.0
+    ) -> None:
+        """threads 模式：单窗口独立监控（仍受 smart 门控，避免空转闪窗）。"""
+        if phase_offset > 0:
+            time.sleep(phase_offset)
+        while not self._stop:
+            chat = self._resolve_sub_chat(whitelist_name)
+            if chat is None:
+                time.sleep(config.POLL_INTERVAL)
+                continue
+            who = getattr(chat, "who", "") or whitelist_name
+            try:
+                if (
+                    config.SUBWINDOW_POLL_MODE != "all"
+                    and not self._chat_needs_read(chat)
+                ):
+                    time.sleep(config.POLL_INTERVAL)
+                    continue
+                self._poll_one_subwindow(chat)
+            except Exception:
+                if not self._stop:
+                    log(f"[{who}] 子窗口监控异常：\n{traceback.format_exc()}")
+            time.sleep(config.POLL_INTERVAL)
+
+    def _start_subwindow_monitors(self) -> None:
+        """为每个白名单子窗口启动独立监控线程（错开相位，减轻抢焦点）。"""
+        self._sub_monitor_threads.clear()
+        targets = [
+            n for n in config.TARGET_NICKNAMES if self._resolve_sub_chat(n) is not None
+        ]
+        if not targets:
+            raise RuntimeError("没有可监控的子窗口")
+        n = len(targets)
+        step = config.POLL_INTERVAL / max(n, 1)
+        for i, name in enumerate(targets):
+            phase = step * i
+            t = threading.Thread(
+                target=self._subwindow_monitor_loop,
+                args=(name, phase),
+                name=f"wx-sub-{name}",
+                daemon=True,
+            )
+            t.start()
+            self._sub_monitor_threads.append(t)
+            log(f"  └ 监控线程：{name}")
+        log(f"共 {n} 个窗口同时监控中")
 
     def run_selected(self) -> None:
         if not config.TARGET_NICKNAMES:
@@ -1237,17 +1572,29 @@ class Monitor:
                 self._teardown_listeners()
         else:
             self._setup_free_subwindows()
-            log("白名单子窗口轮询运行中（请保持弹出的聊天子窗口不要关掉）")
-            try:
-                while not self._stop:
-                    try:
-                        self._poll_subwindows()
-                    except Exception:
-                        if not self._stop:
-                            log(f"轮询异常：\n{traceback.format_exc()}")
-                    time.sleep(config.POLL_INTERVAL)
-            finally:
-                self._teardown_listeners()
+            # 默认 serial+smart：有未读/心跳才读，减少 GetAllMessage 抢焦点闪窗
+            if config.SUBWINDOW_MONITOR == "threads":
+                self._start_subwindow_monitors()
+                try:
+                    while not self._stop:
+                        time.sleep(0.3)
+                finally:
+                    self._teardown_listeners()
+            else:
+                log(
+                    f"单线程监控（serial/{config.SUBWINDOW_POLL_MODE}）："
+                    f"心跳 {config.SUBWINDOW_READ_INTERVAL}s"
+                )
+                try:
+                    while not self._stop:
+                        try:
+                            self._poll_subwindows()
+                        except Exception:
+                            if not self._stop:
+                                log(f"轮询异常：\n{traceback.format_exc()}")
+                        time.sleep(config.POLL_INTERVAL)
+                finally:
+                    self._teardown_listeners()
         log("监听循环已结束")
 
     def run_all(self) -> None:
